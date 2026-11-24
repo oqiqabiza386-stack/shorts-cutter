@@ -74,7 +74,7 @@ v.addEventListener('timeupdate', () => {
 });
 v.addEventListener('seeked', drawPreview);
 v.addEventListener('play', () => requestAnimationFrame(previewLoop));
-function previewLoop() { if (v.paused || v.ended) return; drawPreview(); requestAnimationFrame(previewLoop); }
+function previewLoop() { if (v.paused || v.ended || working) return; drawPreview(); requestAnimationFrame(previewLoop); }
 $('#seek').addEventListener('input', e => { v.currentTime = e.target.value / 1000 * v.duration; });
 document.querySelectorAll('[data-seek]').forEach(b => b.addEventListener('click', () => {
   v.currentTime = Math.min(v.duration, Math.max(0, v.currentTime + +b.dataset.seek));
@@ -274,20 +274,30 @@ $('#hooks').addEventListener('click', e => {
 $('#analyzeBtn').addEventListener('click', analyze);
 
 /* ---------- মিডিয়া হেল্পার ---------- */
+/* মূল ভিডিও এলিমেন্টই ব্যবহার হয় (অনেক ফোনে দ্বিতীয় ডিকোডার চালু হয় না) */
+let AG = null;
+function audioGraph() {
+  if (AG) return AG;
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ac.createMediaElementSource(v);
+  const mon = ac.createGain(); src.connect(mon); mon.connect(ac.destination);
+  const dest = ac.createMediaStreamDestination(); src.connect(dest);
+  return AG = { ac, mon, dest };
+}
 async function makeVideo() {
-  const ev = document.createElement('video');
-  ev.playsInline = true; ev.preload = 'auto';
-  if (v.crossOrigin) ev.crossOrigin = v.crossOrigin;
-  ev.src = v.currentSrc || v.src;
-  await once(ev, 'loadedmetadata');
-  return ev;
+  v.pause(); previewEnd = null; v.controls = false; v.playbackRate = 1;
+  if (v.readyState < 1) await once(v, 'loadedmetadata');
+  return v;
 }
 async function seekTo(ev, t) {
   t = Math.max(t, 0.001);
   if (Math.abs(ev.currentTime - t) < 0.02 && ev.readyState >= 2) return;
   ev.currentTime = t; await once(ev, 'seeked');
 }
-function dispose(ev) { try { ev.pause(); ev.removeAttribute('src'); ev.load(); } catch (e) {} }
+function dispose() {
+  try { v.pause(); v.playbackRate = +$('#speed').value; v.controls = true; if (AG) AG.mon.gain.value = 1; } catch (e) {}
+  drawPreview();
+}
 function waitEnd(ev, end, tick) {
   return new Promise((res, rej) => {
     const iv = setInterval(() => {
@@ -309,14 +319,13 @@ async function exportClip(clip, prog) {
   const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d', { alpha: false });
   const tmp = document.createElement('canvas');
-  let ac, rec, running = true;
+  let rec, running = true;
   try {
     await seekTo(ev, clip.start);
-    ac = new (window.AudioContext || window.webkitAudioContext)();
-    const dest = ac.createMediaStreamDestination();
-    ac.createMediaElementSource(ev).connect(dest); // শুধু রেকর্ডে যাবে, স্পিকারে নয়
+    const g = audioGraph(); g.mon.gain.value = 0; // স্পিকারে নিঃশব্দ, শুধু রেকর্ডে যাবে
+    const ac = g.ac;
     const stream = canvas.captureStream(fps);
-    dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+    g.dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
     const mime = pickMime();
     rec = new MediaRecorder(stream, { mimeType: mime || undefined, videoBitsPerSecond: bitrate, audioBitsPerSecond: 128000 });
     const chunks = []; rec.ondataavailable = e => e.data.size && chunks.push(e.data);
@@ -336,7 +345,7 @@ async function exportClip(clip, prog) {
   } finally {
     running = false;
     try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (e) {}
-    dispose(ev); try { ac && ac.close(); } catch (e) {}
+    dispose();
   }
 }
 function setWorking(b) {
@@ -383,13 +392,12 @@ function addResult(c, r, i) {
 
 /* ---------- Groq Whisper (ঐচ্ছিক) ---------- */
 async function recordAudio(s, e, rate, prog) {
-  const ev = await makeVideo(); let ac, rec;
+  const ev = await makeVideo(); let rec;
   try {
     await seekTo(ev, s);
     ev.playbackRate = rate;
-    ac = new (window.AudioContext || window.webkitAudioContext)();
-    const dest = ac.createMediaStreamDestination();
-    ac.createMediaElementSource(ev).connect(dest);
+    const g = audioGraph(); g.mon.gain.value = 0;
+    const ac = g.ac, dest = g.dest;
     const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(m => MediaRecorder.isTypeSupported(m)) || '';
     rec = new MediaRecorder(dest.stream, { mimeType: mime || undefined, audioBitsPerSecond: 32000 });
     const chunks = []; rec.ondataavailable = x => x.data.size && chunks.push(x.data);
@@ -398,7 +406,7 @@ async function recordAudio(s, e, rate, prog) {
     await waitEnd(ev, e, () => prog(Math.min(1, (ev.currentTime - s) / (e - s))));
     ev.pause(); rec.stop(); await stopped;
     return new Blob(chunks, { type: (mime || 'audio/webm').split(';')[0] });
-  } finally { try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (x) {} dispose(ev); try { ac && ac.close(); } catch (x) {} }
+  } finally { try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (x) {} dispose(); }
 }
 $('#groqBtn').addEventListener('click', async () => {
   const key = $('#groqKey').value.trim(); if (!key) return toast('Groq API key দিন');
